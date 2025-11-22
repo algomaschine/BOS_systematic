@@ -36,6 +36,13 @@ COMMISSION = 0.001
 # This prevents taking trades with stops too far away
 MAX_RISK_PERCENT = 0.03  # 3%
 
+# Maximum drawdown limit (as decimal)
+# Trading stops when drawdown exceeds this limit
+# None = no limit, 0.20 = 20%, 0.30 = 30%
+# Trading resumes when equity recovers to 50% of max drawdown
+# Use drawdown_optimizer.py to find optimal value
+MAX_DRAWDOWN_LIMIT = None  # None = no limit, 0.20 = 20% limit
+
 
 # ==================== STRATEGY PARAMETERS ====================
 

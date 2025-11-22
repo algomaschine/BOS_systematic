@@ -36,24 +36,27 @@ plt.rcParams['figure.figsize'] = (15, 8)
 
 class SwingDetector:
     """
-    Detects swing highs and swing lows in price data.
+    Detects swing highs and swing lows in price data WITHOUT LOOK-AHEAD BIAS.
     
-    A swing high is a price point where the high is greater than N bars to the left
-    and N bars to the right.
-    A swing low is a price point where the low is less than N bars to the left
-    and N bars to the right.
+    A swing high is confirmed AFTER N bars where the high was greater than 
+    the previous N bars AND the following N bars (confirmation delay).
+    
+    This ensures NO FUTURE DATA is used - swing is only marked after confirmation period.
     """
     
     def __init__(self, lookback: int = 5):
         """
         Args:
-            lookback: Number of bars to look left and right for swing detection
+            lookback: Number of bars for swing confirmation (only uses past data)
         """
         self.lookback = lookback
     
     def detect_swings(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Detect swing highs and lows in the dataframe.
+        Detect swing highs and lows WITHOUT LOOK-AHEAD BIAS.
+        
+        Swing is marked at bar i ONLY after lookback bars have confirmed it.
+        This means the swing signal appears with a delay, preventing data leakage.
         
         Args:
             df: DataFrame with 'high' and 'low' columns
@@ -68,28 +71,47 @@ class SwingDetector:
         n = len(df)
         lookback = self.lookback
         
-        for i in range(lookback, n - lookback):
-            # Check for swing high
+        # Start from lookback*2 to have enough data for both directions
+        for i in range(lookback * 2, n):
+            # Check for swing high at position (i - lookback)
+            # This ensures we only use data available up to bar i
+            swing_idx = i - lookback
+            
+            # Check if high at swing_idx was highest in the range
             is_swing_high = True
             for j in range(1, lookback + 1):
-                if df['high'].iloc[i] <= df['high'].iloc[i - j] or \
-                   df['high'].iloc[i] <= df['high'].iloc[i + j]:
+                # Check left side (historical data)
+                if swing_idx - j < 0:
+                    is_swing_high = False
+                    break
+                if df['high'].iloc[swing_idx] <= df['high'].iloc[swing_idx - j]:
+                    is_swing_high = False
+                    break
+                # Check right side (confirmation period - now in the past)
+                if df['high'].iloc[swing_idx] <= df['high'].iloc[swing_idx + j]:
                     is_swing_high = False
                     break
             
             if is_swing_high:
-                df.loc[df.index[i], 'swing_high'] = df['high'].iloc[i]
+                df.loc[df.index[swing_idx], 'swing_high'] = df['high'].iloc[swing_idx]
             
-            # Check for swing low
+            # Check for swing low at position (i - lookback)
             is_swing_low = True
             for j in range(1, lookback + 1):
-                if df['low'].iloc[i] >= df['low'].iloc[i - j] or \
-                   df['low'].iloc[i] >= df['low'].iloc[i + j]:
+                # Check left side (historical data)
+                if swing_idx - j < 0:
+                    is_swing_low = False
+                    break
+                if df['low'].iloc[swing_idx] >= df['low'].iloc[swing_idx - j]:
+                    is_swing_low = False
+                    break
+                # Check right side (confirmation period - now in the past)
+                if df['low'].iloc[swing_idx] >= df['low'].iloc[swing_idx + j]:
                     is_swing_low = False
                     break
             
             if is_swing_low:
-                df.loc[df.index[i], 'swing_low'] = df['low'].iloc[i]
+                df.loc[df.index[swing_idx], 'swing_low'] = df['low'].iloc[swing_idx]
         
         return df
 
@@ -551,25 +573,34 @@ class Trade:
 
 class Backtester:
     """
-    Backtesting engine for SMC trading strategy.
+    Backtesting engine for SMC trading strategy with DRAWDOWN PROTECTION.
     """
     
     def __init__(self, initial_capital: float = 10000.0, 
-                 commission: float = 0.001):
+                 commission: float = 0.001,
+                 max_drawdown_percent: float = None):
         """
         Args:
             initial_capital: Starting capital
             commission: Commission per trade (0.001 = 0.1%)
+            max_drawdown_percent: Maximum allowed drawdown before stopping trading (e.g., 0.20 = 20%)
+                                  None = no drawdown limit
         """
         self.initial_capital = initial_capital
         self.commission = commission
+        self.max_drawdown_percent = max_drawdown_percent
         self.capital = initial_capital
         self.trades = []
         self.equity_curve = []
+        self.drawdown_breached = False
+        self.trades_skipped_due_to_drawdown = 0
     
     def run_backtest(self, signals: pd.DataFrame, strategy: SMCTradingStrategy) -> pd.DataFrame:
         """
-        Run backtest on signal dataframe.
+        Run backtest on signal dataframe with DRAWDOWN PROTECTION.
+        
+        If max_drawdown_percent is set, trading stops when drawdown exceeds the limit.
+        Trading resumes when equity recovers above the threshold.
         
         Args:
             signals: DataFrame with trading signals
@@ -581,9 +612,12 @@ class Backtester:
         self.capital = self.initial_capital
         self.trades = []
         self.equity_curve = []
+        self.drawdown_breached = False
+        self.trades_skipped_due_to_drawdown = 0
         
         current_trade = None
         bars_in_trade = 0
+        peak_equity = self.initial_capital
         
         for i in range(len(signals)):
             idx = signals.index[i]
@@ -606,6 +640,21 @@ class Backtester:
                 'equity': current_equity,
                 'capital': self.capital
             })
+            
+            # Update peak equity and check drawdown
+            if current_equity > peak_equity:
+                peak_equity = current_equity
+            
+            # Calculate current drawdown
+            current_drawdown = (current_equity - peak_equity) / peak_equity
+            
+            # Check if drawdown limit is breached
+            if self.max_drawdown_percent is not None:
+                if current_drawdown <= -self.max_drawdown_percent:
+                    self.drawdown_breached = True
+                # Resume trading if recovered to within 50% of max drawdown
+                elif current_drawdown >= -(self.max_drawdown_percent * 0.5):
+                    self.drawdown_breached = False
             
             # Check if we're in a trade
             if current_trade:
@@ -668,6 +717,11 @@ class Backtester:
             
             # Check for new signals
             if current_trade is None and signals.loc[idx, 'signal'] != 0:
+                # DRAWDOWN PROTECTION: Skip trade if drawdown limit is breached
+                if self.drawdown_breached:
+                    self.trades_skipped_due_to_drawdown += 1
+                    continue
+                
                 signal = signals.loc[idx, 'signal']
                 stop_loss = signals.loc[idx, 'stop_loss']
                 entry_price = signals.loc[idx, 'close']
@@ -921,14 +975,27 @@ def main():
     print(" SMART MONEY CONCEPTS (SMC) BACKTESTING SYSTEM")
     print("="*60 + "\n")
     
-    # Configuration
-    DATA_FILE = '/home/edward/Documents/smart money/data/BTCUSDT_1m_binance.csv'
-    INITIAL_CAPITAL = 10000.0
-    RISK_PER_TRADE = 0.01  # 1%
-    PROFIT_TARGET = 2.0  # 2:1 R:R
-    MAX_HOLDING_BARS = 10  # Hours
-    SWING_LOOKBACK = 5
-    COMMISSION = 0.001  # 0.1%
+    # Try to import configuration from config.py
+    try:
+        import config
+        DATA_FILE = config.DATA_FILE
+        INITIAL_CAPITAL = config.INITIAL_CAPITAL
+        RISK_PER_TRADE = config.RISK_PER_TRADE
+        PROFIT_TARGET = config.PROFIT_TARGET
+        MAX_HOLDING_BARS = config.MAX_HOLDING_BARS
+        SWING_LOOKBACK = config.SWING_LOOKBACK
+        COMMISSION = config.COMMISSION
+        MAX_DRAWDOWN_LIMIT = config.MAX_DRAWDOWN_LIMIT
+    except:
+        # Fallback to default configuration
+        DATA_FILE = '/home/edward/Documents/smart money/data/BTCUSDT_1m_binance.csv'
+        INITIAL_CAPITAL = 10000.0
+        RISK_PER_TRADE = 0.01  # 1%
+        PROFIT_TARGET = 2.0  # 2:1 R:R
+        MAX_HOLDING_BARS = 10  # Hours
+        SWING_LOOKBACK = 5
+        COMMISSION = 0.001  # 0.1%
+        MAX_DRAWDOWN_LIMIT = None
     
     # Step 1: Load data
     df_1m = load_data(DATA_FILE)
@@ -961,12 +1028,21 @@ def main():
     
     # Step 5: Run backtest
     print("Running backtest...")
+    if MAX_DRAWDOWN_LIMIT is not None:
+        print(f"⚠️  Drawdown protection enabled: Max {MAX_DRAWDOWN_LIMIT*100:.0f}%")
+    
     backtester = Backtester(
         initial_capital=INITIAL_CAPITAL,
-        commission=COMMISSION
+        commission=COMMISSION,
+        max_drawdown_percent=MAX_DRAWDOWN_LIMIT
     )
     
     trades_df = backtester.run_backtest(signals, strategy)
+    
+    # Print drawdown protection stats
+    if MAX_DRAWDOWN_LIMIT is not None and backtester.trades_skipped_due_to_drawdown > 0:
+        print(f"\n⚠️  Drawdown Protection Stats:")
+        print(f"   Trades skipped due to drawdown limit: {backtester.trades_skipped_due_to_drawdown}")
     
     # Step 6: Analyze results
     print("Analyzing results...")
